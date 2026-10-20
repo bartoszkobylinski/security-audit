@@ -1,0 +1,206 @@
+name: Security audit
+
+# Reusable security audit for the owner's repositories (milamber_assistant
+# issue #205, Control Plane decision O4 stage 2b). It covers what Dependabot
+# does not: secrets in the code, risky Python constructs, and a second opinion
+# on the locked Python dependencies.
+#
+# Policy (owner, 2026-10-20):
+#   - a secret in the checked-out tree FAILS the job;
+#   - secrets in git history, bandit (high severity) and pip-audit only REPORT,
+#     in the run summary, so an old repository does not turn red on day one.
+#
+# Logs and summaries never contain a secret: gitleaks runs with --redact and
+# only rule, file and line are printed.
+#
+# The repository is public on purpose: a public repository cannot call a
+# reusable workflow from a private one, and nothing here is confidential.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: >-
+          JSON for runs-on. Public callers keep the default; private callers pass
+          their self-hosted labels, e.g. '["self-hosted","macOS","llmbus"]'.
+        type: string
+        default: '"ubuntu-latest"'
+      timeout:
+        description: Job timeout in minutes.
+        type: number
+        default: 20
+      bandit-paths:
+        description: Space-separated paths bandit scans; missing paths are skipped.
+        type: string
+        default: src
+      requirements-file:
+        description: Used for pip-audit when the repository has no uv.lock.
+        type: string
+        default: requirements.txt
+      scan-history:
+        description: Also scan the whole git history for secrets (report only).
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  PIP_AUDIT_VERSION: 2.10.1
+  BANDIT_VERSION: 1.9.4
+
+jobs:
+  audit:
+    name: Security audit
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.scan-history && '0' || '1' }}
+          persist-credentials: false
+
+      - name: Install gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64)   asset=linux_x64;    sum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;;
+            macOS-ARM64) asset=darwin_arm64; sum=b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5 ;;
+            macOS-X64)   asset=darwin_x64;   sum=dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709 ;;
+            *) echo "no pinned gitleaks build for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${asset}.tar.gz"
+          echo "$sum  $archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+
+      # Runs before anything installs dependencies, so only the repository's own
+      # files are in the tree.
+      - name: Secrets in the tree (blocking)
+        id: tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/gitleaks" dir . --redact --no-banner --exit-code 0 \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-tree.json"
+          python3 - "$RUNNER_TEMP/gitleaks-tree.json" <<'EOF' | tee "$RUNNER_TEMP/tree.md"
+          import json, sys
+          found = json.load(open(sys.argv[1]))
+          print(f"### Secrets in the tree: {len(found)}")
+          for f in found:
+              print(f"- `{f['RuleID']}` {f['File']}:{f['StartLine']}")
+          EOF
+          echo "count=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))))" "$RUNNER_TEMP/gitleaks-tree.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Secrets in history (report only)
+        if: inputs.scan-history
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/gitleaks" git . --redact --no-banner --exit-code 0 \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-history.json"
+          python3 - "$RUNNER_TEMP/gitleaks-history.json" <<'EOF' | tee "$RUNNER_TEMP/history.md"
+          import json, sys
+          found = json.load(open(sys.argv[1]))
+          print(f"### Secrets in git history (report only): {len(found)}")
+          for f in found[:50]:
+              print(f"- `{f['RuleID']}` {f['File']}:{f['StartLine']} in {f['Commit'][:8]}")
+          if len(found) > 50:
+              print(f"- … and {len(found) - 50} more")
+          EOF
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
+
+      - name: Python dependencies (pip-audit, report only)
+        shell: bash
+        env:
+          REQUIREMENTS_FILE: ${{ inputs.requirements-file }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/pip-audit.md"
+          req="$RUNNER_TEMP/requirements-audit.txt"
+          if [ -f uv.lock ]; then
+            uv export --frozen --no-hashes --all-extras --no-emit-project --format requirements-txt -o "$req" -q
+            source="uv.lock"
+          elif [ -f "$REQUIREMENTS_FILE" ]; then
+            cp "$REQUIREMENTS_FILE" "$req"
+            source="$REQUIREMENTS_FILE"
+          else
+            echo "### pip-audit: skipped (no uv.lock, no $REQUIREMENTS_FILE)" | tee "$out"
+            exit 0
+          fi
+          uvx "pip-audit@${PIP_AUDIT_VERSION}" -r "$req" --no-deps --disable-pip \
+            --progress-spinner off -f json -o "$RUNNER_TEMP/pip-audit.json"
+          status=$?
+          python3 - "$RUNNER_TEMP/pip-audit.json" "$source" "$status" <<'EOF' | tee "$out"
+          import json, sys
+          path, source, status = sys.argv[1], sys.argv[2], sys.argv[3]
+          try:
+              deps = json.load(open(path))["dependencies"]
+          except (OSError, ValueError, KeyError):
+              print(f"### pip-audit ({source}): did not produce a report (exit {status})")
+              sys.exit(0)
+          vulnerable = [d for d in deps if d.get("vulns")]
+          print(f"### pip-audit ({source}, report only): {len(vulnerable)} vulnerable packages")
+          for d in vulnerable:
+              ids = ", ".join(v["id"] for v in d["vulns"])
+              fixes = sorted({f for v in d["vulns"] for f in v.get("fix_versions", [])})
+              print(f"- {d['name']} {d.get('version', '?')}: {ids} (fix: {', '.join(fixes) or 'none'})")
+          EOF
+          exit 0
+
+      - name: Python code (bandit high severity, report only)
+        shell: bash
+        env:
+          BANDIT_PATHS: ${{ inputs.bandit-paths }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/bandit.md"
+          paths=()
+          for p in $BANDIT_PATHS; do [ -e "$p" ] && paths+=("$p"); done
+          if [ ${#paths[@]} -eq 0 ]; then
+            echo "### bandit: skipped (none of: $BANDIT_PATHS)" | tee "$out"
+            exit 0
+          fi
+          uvx "bandit@${BANDIT_VERSION}" -r "${paths[@]}" --severity-level high -q \
+            -f json -o "$RUNNER_TEMP/bandit.json"
+          python3 - "$RUNNER_TEMP/bandit.json" <<'EOF' | tee "$out"
+          import json, sys
+          try:
+              results = json.load(open(sys.argv[1]))["results"]
+          except (OSError, ValueError, KeyError):
+              print("### bandit: did not produce a report")
+              sys.exit(0)
+          print(f"### bandit high severity (report only): {len(results)}")
+          for r in results:
+              print(f"- `{r['test_id']}` {r['filename']}:{r['line_number']} — {r['issue_text']}")
+          EOF
+          exit 0
+
+      - name: Summary and verdict
+        if: always()
+        shell: bash
+        env:
+          TREE_COUNT: ${{ steps.tree.outputs.count }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Security audit"
+            for part in tree history pip-audit bandit; do
+              [ -f "$RUNNER_TEMP/$part.md" ] && cat "$RUNNER_TEMP/$part.md" && echo
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "${TREE_COUNT:-}" ]; then
+            echo "the tree scan did not finish"; exit 1
+          fi
+          if [ "$TREE_COUNT" != "0" ]; then
+            echo "$TREE_COUNT secret(s) in the checked-out tree — see the summary"; exit 1
+          fi
