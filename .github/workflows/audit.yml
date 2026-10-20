@@ -124,7 +124,9 @@ jobs:
         env:
           REQUIREMENTS_FILE: ${{ inputs.requirements-file }}
         run: |
-          set -uo pipefail
+          # GitHub runs `shell: bash` with -e; report-only steps must not stop on
+          # a tool that exits non-zero because it found something.
+          set +e -uo pipefail
           out="$RUNNER_TEMP/pip-audit.md"
           req="$RUNNER_TEMP/requirements-audit.txt"
           if [ -f uv.lock ]; then
@@ -162,7 +164,9 @@ jobs:
         env:
           BANDIT_PATHS: ${{ inputs.bandit-paths }}
         run: |
-          set -uo pipefail
+          # GitHub runs `shell: bash` with -e; report-only steps must not stop on
+          # a tool that exits non-zero because it found something.
+          set +e -uo pipefail
           out="$RUNNER_TEMP/bandit.md"
           paths=()
           for p in $BANDIT_PATHS; do [ -e "$p" ] && paths+=("$p"); done
