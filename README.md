@@ -12,7 +12,9 @@ Dependabot does not cover.
 
 gitleaks runs with `--redact`: logs and the summary show the rule, file and
 line, never the value. The gitleaks binary is downloaded from its release and
-checked against a pinned SHA-256; actions are pinned by commit.
+checked against a pinned SHA-256; actions are pinned by commit. A transient
+download error is retried, at most 6 attempts in 2 minutes; the checksum
+still judges what arrives (`tests/install-gitleaks.sh`).
 
 ## Use
 
