@@ -73,7 +73,11 @@ jobs:
             *) echo "no pinned gitleaks build for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
           esac
           archive="$RUNNER_TEMP/gitleaks.tar.gz"
-          curl -fsSL -o "$archive" \
+          # A transient 5xx from the release CDN turned main red (lovspor#794).
+          # Bounded: 6 attempts in at most 2 minutes. The checksum below still
+          # judges whatever arrives, so a retry cannot hide a bad download.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            -o "$archive" \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${asset}.tar.gz"
           echo "$sum  $archive" | shasum -a 256 -c -
           tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
